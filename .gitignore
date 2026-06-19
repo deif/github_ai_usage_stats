@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Generated dashboard output
+dashboard.html
+demo/demo_dashboard.html
+anonymization_key.csv
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
