@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
 """
-Interactive AI Usage Dashboard (Bokeh).
+AI Usage Dashboard generator (Bokeh).
 
 Reads one or more GitHub Copilot "AI Usage Report" CSV files, de-duplicates
 overlapping/identical rows, and produces a single self-contained, interactive
 HTML dashboard (pan / zoom / hover / legend) describing AI model usage.
-
-This is a single, self-contained script: data loading, de-duplication,
-anonymization, the monthly spend projection and all dashboard panels live here.
 
 Usage examples
 --------------
@@ -17,14 +14,13 @@ Usage examples
     # Point at a directory of reports, custom output file
     python generate_dashboard.py --input ./reports --output dashboard.html
 
-    # Anonymized, top 15 items, with a 1900 base-fee offset in the projection
-    python generate_dashboard.py --anonymize --top 15 --monthly-offset 1900
+    # Anonymized, top 15 items in "top N" charts
+    python generate_dashboard.py --anonymize --top 15
 """
 
 from __future__ import annotations
 
 import argparse
-import calendar
 import glob
 import os
 import sys
@@ -42,15 +38,16 @@ from bokeh.models import (
     FactorRange,
     HoverTool,
     Legend,
+    LinearAxis,
     LinearColorMapper,
     NumeralTickFormatter,
+    Range1d,
     RangeSlider,
 )
 from bokeh.palettes import Category10, Category20, Category20b
 from bokeh.plotting import figure, save
 from bokeh.resources import INLINE
 from bokeh.transform import cumsum, dodge
-
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -91,9 +88,8 @@ DAY_ORDER = [
     "Sunday",
 ]
 
-# Default flat amount added on top of metered net spend in the projection
-# (e.g. a base plan fee). 0 means "metered spend only".
-DEFAULT_MONTHLY_OFFSET = 0.0
+# Flat base plan fee added on top of metered net spend in the projection.
+BASE_MONTHLY_COST = 1900.0
 
 
 # ---------------------------------------------------------------------------
@@ -220,7 +216,7 @@ def anonymize_users(df: pd.DataFrame, outdir: str) -> pd.DataFrame:
     df["username"] = df["username"].map(mapping)
 
     key_path = os.path.join(outdir, "anonymization_key.csv")
-    os.makedirs(outdir or ".", exist_ok=True)
+    os.makedirs(outdir, exist_ok=True)
     (
         pd.DataFrame(
             {"pseudonym": list(mapping.values()), "username": list(mapping.keys())}
@@ -248,6 +244,8 @@ def monthly_spend_projection(
     projected value but is excluded from the run-rate calculation, so it does
     not distort the per-day slope.
     """
+    import calendar
+
     latest = df["date"].max()
     year, month = latest.year, latest.month
     last_day = latest.day
@@ -295,6 +293,7 @@ def monthly_spend_projection(
         "fixed_monthly_cost": float(fixed_monthly_cost),
         "projected_total": float(projected_total),
     }
+
 
 FULL_W = 1320
 HALF_W = 650
@@ -717,20 +716,8 @@ def panel_auto_vs_manual(df):
     return _pie(split, "Auto-selected vs. manually chosen", palette=["#64B5CD", "#CCB974"])
 
 
-def _cap_crossing_day(days, values, cap):
-    """Return the (interpolated) x where a piecewise-linear (days, values)
-    series first reaches ``cap``, or None if it never does."""
-    for (x0, y0), (x1, y1) in zip(zip(days, values), zip(days[1:], values[1:])):
-        if y0 <= cap <= y1 and y1 != y0:
-            return x0 + (cap - y0) * (x1 - x0) / (y1 - y0)
-        if y0 >= cap and x0 == days[0]:  # already at/over the cap at the start
-            return x0
-    return None
-
-
-def panel_spend_projection(df, monthly_offset=DEFAULT_MONTHLY_OFFSET,
-                           spending_cap=None):
-    proj = monthly_spend_projection(df, fixed_monthly_cost=monthly_offset)
+def panel_spend_projection(df):
+    proj = monthly_spend_projection(df, fixed_monthly_cost=BASE_MONTHLY_COST)
     actual = ColumnDataSource(dict(day=proj["days"], value=proj["cumulative"]))
     projected = ColumnDataSource(dict(day=proj["proj_days"], value=proj["proj_values"]))
     endpoint = ColumnDataSource(dict(
@@ -747,23 +734,7 @@ def panel_spend_projection(df, monthly_offset=DEFAULT_MONTHLY_OFFSET,
         ),
         toolbar_location="above", tools="pan,box_zoom,wheel_zoom,reset,save",
         x_range=(1, proj["days_in_month"]),
-        y_range=(0, max(proj["projected_total"], spending_cap or 0) * 1.1),
     )
-
-    from bokeh.models import Label, Span
-
-    # Show the flat base-fee offset explicitly as a shaded baseline so it is
-    # clear the cumulative line sits on top of it (rather than starting at 0).
-    if monthly_offset and monthly_offset > 0:
-        base_line = Span(location=monthly_offset, dimension="width",
-                         line_color="#999999", line_width=2, line_dash="dotted")
-        p.add_layout(base_line)
-        p.add_layout(Label(
-            x=1, y=monthly_offset, x_offset=4, y_offset=2,
-            text=f"Base fee: {monthly_offset:,.0f}",
-            text_color="#777777", text_font_size="10pt",
-        ))
-
     r1 = p.line("day", "value", source=actual, color="#4C72B0", line_width=3,
                 legend_label="Cumulative net spend to date (incl. base fee)")
     p.scatter("day", "value", source=actual, color="#4C72B0", size=6)
@@ -784,35 +755,6 @@ def panel_spend_projection(df, monthly_offset=DEFAULT_MONTHLY_OFFSET,
     p.yaxis.formatter = NumeralTickFormatter(format="0,0")
     p.legend.location = "top_left"
 
-    # Optional monthly spending cap: a horizontal reference line plus a
-    # vertical line marking the day the (projected) spend crosses the cap.
-    cross_day = None
-    if spending_cap and spending_cap > 0:
-        cap_line = Span(location=spending_cap, dimension="width",
-                        line_color="#C44E52", line_width=2, line_dash="dotted")
-        p.add_layout(cap_line)
-        p.add_layout(Label(
-            x=1, y=spending_cap, x_offset=4, y_offset=2,
-            text=f"Spending cap: {spending_cap:,.0f}",
-            text_color="#C44E52", text_font_size="10pt", text_font_style="bold",
-        ))
-
-        # Search the full month curve (actual to date, then projection).
-        all_days = list(proj["days"]) + list(proj["proj_days"][1:])
-        all_values = list(proj["cumulative"]) + list(proj["proj_values"][1:])
-        cross_day = _cap_crossing_day(all_days, all_values, spending_cap)
-        if cross_day is not None:
-            cross_line = Span(location=cross_day, dimension="height",
-                              line_color="#C44E52", line_width=2,
-                              line_dash="dashed")
-            p.add_layout(cross_line)
-            p.add_layout(Label(
-                x=cross_day, y=spending_cap, x_offset=6, y_offset=-18,
-                text=f"Cap reached ~day {cross_day:.1f}",
-                text_color="#C44E52", text_font_size="10pt",
-                text_font_style="bold",
-            ))
-
     notes = []
     if proj.get("fixed_monthly_cost", 0):
         notes.append(
@@ -824,17 +766,6 @@ def panel_spend_projection(df, monthly_offset=DEFAULT_MONTHLY_OFFSET,
             f"Run-rate based on net spend from day {proj['first_spend_day']} "
             f"onward (earlier days had no billed spend)."
         )
-    if spending_cap and spending_cap > 0:
-        if cross_day is not None:
-            notes.append(
-                f"Projected to reach the {spending_cap:,.0f} USD cap around "
-                f"day {cross_day:.1f} of the month."
-            )
-        else:
-            notes.append(
-                f"Projected to stay under the {spending_cap:,.0f} USD cap "
-                f"this month."
-            )
     if notes:
         caption = Div(
             text="<p style='font-family:sans-serif;color:#555;margin:0 0 8px 4px'>"
@@ -845,31 +776,99 @@ def panel_spend_projection(df, monthly_offset=DEFAULT_MONTHLY_OFFSET,
     return p
 
 
+def panel_credits_net_gross_projection(df):
+    """Cumulative credits, net spend and gross spend for the current month,
+    each with its own month-end run-rate projection. Credits (a count) share
+    the left axis; net/gross spend (both USD) share the right axis.
+    """
+    proj_credits = monthly_spend_projection(df, amount_col="quantity")
+    proj_net = monthly_spend_projection(df, amount_col="net_amount")
+    proj_gross = monthly_spend_projection(df, amount_col="gross_amount")
+
+    credits_actual = ColumnDataSource(dict(day=proj_credits["days"], value=proj_credits["cumulative"]))
+    credits_proj = ColumnDataSource(dict(day=proj_credits["proj_days"], value=proj_credits["proj_values"]))
+    net_actual = ColumnDataSource(dict(day=proj_net["days"], value=proj_net["cumulative"]))
+    net_proj = ColumnDataSource(dict(day=proj_net["proj_days"], value=proj_net["proj_values"]))
+    gross_actual = ColumnDataSource(dict(day=proj_gross["days"], value=proj_gross["cumulative"]))
+    gross_proj = ColumnDataSource(dict(day=proj_gross["proj_days"], value=proj_gross["proj_values"]))
+
+    p = figure(
+        height=ROW_H, width=FULL_W,
+        title=(
+            f"Monthly credits & spend projection — {proj_credits['month_label']} "
+            f"(day {proj_credits['last_day']} of {proj_credits['days_in_month']})"
+        ),
+        toolbar_location="above", tools="pan,box_zoom,wheel_zoom,reset,save",
+        x_range=(1, proj_credits["days_in_month"]),
+    )
+
+    # Right-hand axis (USD) for net/gross spend; left (default) axis is credits.
+    max_usd = max(proj_net["projected_total"], proj_gross["projected_total"]) or 1
+    p.extra_y_ranges = {"usd": Range1d(start=0, end=max_usd * 1.15)}
+    p.add_layout(LinearAxis(y_range_name="usd", axis_label="Cumulative spend (USD)"), "right")
+
+    r1 = p.line("day", "value", source=credits_actual, color="#4C72B0", line_width=3,
+                legend_label="Credits used to date")
+    p.scatter("day", "value", source=credits_actual, color="#4C72B0", size=6)
+    r2 = p.line("day", "value", source=credits_proj, color="#4C72B0", line_width=3,
+                line_dash="dashed", legend_label="Credits projected")
+
+    r3 = p.line("day", "value", source=net_actual, color="#55A868", line_width=3,
+                legend_label="Net spend to date", y_range_name="usd")
+    p.scatter("day", "value", source=net_actual, color="#55A868", size=6, y_range_name="usd")
+    r4 = p.line("day", "value", source=net_proj, color="#55A868", line_width=3,
+                line_dash="dashed", legend_label="Net spend projected", y_range_name="usd")
+
+    r5 = p.line("day", "value", source=gross_actual, color="#C44E52", line_width=3,
+                legend_label="Gross spend to date", y_range_name="usd")
+    p.scatter("day", "value", source=gross_actual, color="#C44E52", size=6, y_range_name="usd")
+    r6 = p.line("day", "value", source=gross_proj, color="#C44E52", line_width=3,
+                line_dash="dashed", legend_label="Gross spend projected", y_range_name="usd")
+
+    p.add_tools(HoverTool(
+        tooltips=[("Day", "@day"), ("Value", "@value{0,0}")],
+        renderers=[r1, r2, r3, r4, r5, r6], mode="vline",
+    ))
+    p.xaxis.axis_label = "Day of month"
+    p.yaxis[0].axis_label = "Cumulative credits used"
+    p.yaxis.formatter = NumeralTickFormatter(format="0,0")
+    p.legend.location = "top_left"
+    p.legend.click_policy = "hide"
+
+    caption = Div(
+        text=(
+            "<p style='font-family:sans-serif;color:#555;margin:0 0 8px 4px'>"
+            f"Projected month-end — Credits: {proj_credits['projected_total']:,.0f} &middot; "
+            f"Net: {proj_net['projected_total']:,.0f} USD &middot; "
+            f"Gross: {proj_gross['projected_total']:,.0f} USD</p>"
+        ),
+        width=FULL_W,
+    )
+    return column(p, caption)
+
+
 # ---------------------------------------------------------------------------
 # Assembly
 # ---------------------------------------------------------------------------
 
-def _described(plot, text, width=FULL_W):
-    """Stack a short descriptive caption above a plot/layout."""
-    caption = Div(
-        text=(
-            "<p style='font-family:sans-serif;color:#666;"
-            "margin:6px 0 0 6px;font-size:12px'>" + text + "</p>"
-        ),
-        width=width,
-    )
-    return column(caption, plot)
-
-
-def build_dashboard(df, output_path, top, monthly_offset=DEFAULT_MONTHLY_OFFSET,
-                    spending_cap=None):
+def build_dashboard(df, output_path, top):
+    n_users = df["username"].nunique()
+    per_user_spend = df.groupby("username")["net_amount"].sum()
+    avg_spend_per_user = per_user_spend.mean() if n_users else 0.0
+    median_spend_per_user = per_user_spend.median() if n_users else 0.0
+    max_spend_per_user = per_user_spend.max() if n_users else 0.0
+    min_spend_per_user = per_user_spend.min() if n_users else 0.0
     header = Div(
         text="<h1 style='font-family:sans-serif;margin:0'>AI Usage Dashboard</h1>"
         f"<p style='font-family:sans-serif;color:#555'>"
         f"{len(df):,} records &middot; "
         f"{df['date'].min().date()} → {df['date'].max().date()} &middot; "
-        f"{df['username'].nunique()} users &middot; "
-        f"{df['model'].nunique()} models</p>",
+        f"{n_users} users &middot; "
+        f"{df['model'].nunique()} models &middot; "
+        f"Avg net spend/user: {avg_spend_per_user:,.2f} USD &middot; "
+        f"Median: {median_spend_per_user:,.2f} USD &middot; "
+        f"Max: {max_spend_per_user:,.2f} USD &middot; "
+        f"Min: {min_spend_per_user:,.2f} USD</p>",
         width=FULL_W,
     )
 
@@ -910,69 +909,21 @@ def build_dashboard(df, output_path, top, monthly_offset=DEFAULT_MONTHLY_OFFSET,
 
     grid = column(
         top_slider,
+        row(panel_models_by_credits(df, top_slider),
+            panel_models_by_records(df, top_slider)),
+        row(panel_active_weekdays(df), panel_credits_histogram(df)),
+        usage_ts,
+        models_ts,
+        family_ts,
+        panel_spend_projection(df),
+        panel_credits_net_gross_projection(df),
+        row(users_credits, users_cost),
+        panel_top_records(df, top_slider, max_n=slider_max),
+        panel_weekday_model_heatmap(df, top),
         row(
-            _described(
-                panel_models_by_credits(df, top_slider),
-                "Which models consume the most AI credits — the heaviest "
-                "cost drivers.", width=HALF_W),
-            _described(
-                panel_models_by_records(df, top_slider),
-                "Which models are invoked most often, regardless of how many "
-                "credits each call costs.", width=HALF_W),
-        ),
-        row(
-            _described(
-                panel_active_weekdays(df),
-                "How credit usage is distributed across the days of the week "
-                "(weekends highlighted).", width=HALF_W),
-            _described(
-                panel_credits_histogram(df),
-                "How credits-per-record are distributed — separating many "
-                "cheap calls from a few expensive ones.", width=HALF_W),
-        ),
-        _described(
-            usage_ts,
-            "Daily AI credits consumed and the number of active users over "
-            "time."),
-        _described(
-            models_ts,
-            "How each model's share of daily usage (by record count) evolves "
-            "over time."),
-        _described(
-            family_ts,
-            "How each model family's share of daily usage (by record count) "
-            "evolves over time."),
-        _described(
-            panel_spend_projection(df, monthly_offset, spending_cap),
-            "Month-to-date cumulative spend with a run-rate projection to "
-            "month-end."),
-        row(
-            _described(
-                users_credits,
-                "Which users consume the most AI credits.", width=HALF_W),
-            _described(
-                users_cost,
-                "Which users cost the most, comparing gross vs. net "
-                "(post-discount) spend.", width=HALF_W),
-        ),
-        _described(
-            panel_top_records(df, top_slider, max_n=slider_max),
-            "The single largest usage records by credits — the biggest "
-            "individual calls and who made them."),
-        _described(
-            panel_weekday_model_heatmap(df, top),
-            "Credit usage for the top models broken down by day of the week."),
-        row(
-            _described(
-                panel_family_credit_pie(df, color_map=family_colors),
-                "Share of total credits by model family.", width=THIRD_W),
-            _described(
-                panel_family_record_pie(df, color_map=family_colors),
-                "Share of usage records by model family.", width=THIRD_W),
-            _described(
-                panel_auto_vs_manual(df),
-                "Credits from auto-selected vs. manually chosen models.",
-                width=THIRD_W),
+            panel_family_credit_pie(df, color_map=family_colors),
+            panel_family_record_pie(df, color_map=family_colors),
+            panel_auto_vs_manual(df),
         ),
     )
 
@@ -997,15 +948,6 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
                         help="How many items to show in 'top N' charts (default: 10).")
     parser.add_argument("--anonymize", "-a", action="store_true",
                         help="Replace usernames with stable pseudonyms.")
-    parser.add_argument("--monthly-offset", "-m", type=float,
-                        default=DEFAULT_MONTHLY_OFFSET,
-                        help=("Flat amount (e.g. a base plan fee) added on top "
-                              "of metered net spend in the monthly projection "
-                              "(default: 0)."))
-    parser.add_argument("--spending-cap", "-c", type=float, default=None,
-                        help=("Monthly spending cap. Draws a horizontal cap "
-                              "line and a vertical line where the projected "
-                              "spend crosses it (default: none)."))
     return parser.parse_args(argv)
 
 
@@ -1025,8 +967,7 @@ def main(argv: List[str]) -> int:
         df = anonymize_users(df, outdir)
 
     print(f"\nBuilding interactive dashboard '{args.output}'...")
-    build_dashboard(df, args.output, args.top, args.monthly_offset,
-                    args.spending_cap)
+    build_dashboard(df, args.output, args.top)
     print("Done. Open the HTML file in a browser.")
     return 0
 

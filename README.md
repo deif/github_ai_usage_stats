@@ -14,7 +14,7 @@ reads the CSV exports and produces one interactive `dashboard.html`
 - Top users by credits and by cost (gross vs. net)
 - Daily usage over time (credits and active users)
 - Model / model-family usage trends (stacked areas)
-- Monthly net-spend projection with run-rate and a configurable cost offset
+- Monthly net-spend projection with run-rate and a flat base-fee offset
 - Weekday × model heatmap and credit/family pie charts
 - Auto-selected vs. manually chosen model split
 - Automatic de-duplication of overlapping report files
@@ -96,7 +96,7 @@ time.
 ### Monthly net-spend projection
 
 Month-to-date cumulative spend with a run-rate projection to month-end,
-including the optional base-fee offset, spending cap and cap-crossing marker.
+including the flat base-fee offset.
 
 ![Monthly net-spend projection](demo/images/spend_projection.png)
 
@@ -138,25 +138,19 @@ Credits from auto-selected vs. manually chosen models.
 ```bash
 python generate_dashboard.py \
     --input ./reports \        # CSV file, directory, or glob (default: current dir)
-    --output dashboard.html \  # output HTML file
+    --output dashboard.html \  # output HTML file (default: dashboard.html)
     --top 15 \                 # items shown in "top N" charts (default: 10)
-    --monthly-offset 1900 \    # flat fee added to the spend projection (default: 0)
-    --spending-cap 5000 \      # draw a monthly cap line + crossing marker (default: none)
     --anonymize                # replace usernames with stable pseudonyms
 ```
 
-The `--monthly-offset` value is a flat amount (e.g. a base plan fee) added on
-top of the metered net spend in the monthly projection. It does not affect the
-per-day run-rate. It defaults to `0`.
-
-The `--spending-cap` value draws a horizontal line at the given monthly cap on
-the spend-projection chart, plus a vertical line marking the day the projected
-spend crosses it (with a note if the cap isn't reached this month). Off by
-default.
+The monthly net-spend projection also adds a flat base plan fee on top of the
+metered net spend (see `BASE_MONTHLY_COST` in
+[generate_dashboard.py](generate_dashboard.py)); it does not affect the
+per-day run-rate.
 
 ## Input data format
 
-The scripts read GitHub Copilot AI Usage Report CSV files. Each row is one
+The script reads GitHub Copilot AI Usage Report CSV files. Each row is one
 usage record; multiple/overlapping exports are de-duplicated automatically.
 Expected columns:
 
